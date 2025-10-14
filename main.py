@@ -225,9 +225,10 @@ class Dashboard:
             time.sleep(1)
             self.yarr.clear()
             self.tarr.clear()
+            self.update_graph()
             self.running = True
             threading.Thread(target=self.serial_update_data, daemon=True).start()
-            self.update_graph()
+
 
 
 
@@ -358,7 +359,9 @@ class Dashboard:
         else:
             messagebox.showerror("config", "no mcu available")
 
-
+    def setup(self):
+        # try:
+        pass
 
 if __name__ == "__main__":
     dashboard = Dashboard("abel")
