@@ -7,7 +7,7 @@ from matplotlib.ticker import MultipleLocator
 import threading
 import serial
 from tkinter import messagebox
-
+import serial.tools.list_ports
 
 
 class Dashboard:
@@ -23,7 +23,7 @@ class Dashboard:
         self.S_point = 0
         self.yarr = []
         self.tarr = []
-        self.port = "COM3"
+        self.port = None
         self.baudrate = "9600"
         self.connectivity_setting = "Serial"
         self.running = False
@@ -43,12 +43,9 @@ class Dashboard:
         style.map('Custom2.TButton', background=[("active", "darkorange"), ("!active", "orange")],
                   foreground=[("pressed", "yellow"), ("active", "white")])
         self.control_panel()
-
-
-
         self.dashboard.mainloop()
 
-    def control_panel(self)-> None:
+    def control_panel(self) -> None:
         Frame = ttk.LabelFrame(self.dashboard,text="PID CONTROL", borderwidth=2, relief="solid", height=100)
         Frame.pack(side="top", fill="x")
         Frame.pack_propagate(False)
@@ -59,29 +56,28 @@ class Dashboard:
         #proportional
         P_gain = tk.IntVar()
         ttk.Label(Frame, text="KP:").grid(row=0,column=0, sticky="nw", pady=(20, 0), padx=(10, 0))
-        ttk.Entry(Frame,textvariable=P_gain, width=10, font=("segoeUI 10")).grid(column=1, row=0,sticky="n", pady=(20, 0))
+        ttk.Entry(Frame,textvariable=P_gain, width=10, font=("segoe UI", 10)).grid(column=1, row=0,sticky="n", pady=(20, 0))
         P_gain.set(0)
 
 
         #INTEGRAL
         I_gain = tk.IntVar()
         ttk.Label(Frame, text="KI:").grid(row=0,column=2, sticky="nw", pady=(20, 0), padx=(20, 0))
-        ttk.Entry(Frame,textvariable=I_gain, width=10, font=("segoeUI 10")).grid(column=3, row=0, sticky="n", pady=(20, 0) )
+        ttk.Entry(Frame,textvariable=I_gain, width=10, font=("segoe UI", 10)).grid(column=3, row=0, sticky="n", pady=(20, 0) )
         I_gain.set(0)
 
 
         #INTEGRAL
         D_gain = tk.IntVar()
         ttk.Label(Frame, text="KD:").grid(row=0,column=4, sticky="n", pady=(20, 0), padx=(20, 0))
-        ttk.Entry(Frame,textvariable=D_gain, width=10, font=("segoeUI 10")).grid(column=5, row=0, sticky="n", pady=(20, 0))
+        ttk.Entry(Frame,textvariable=D_gain, width=10, font=("segoe UI", 10)).grid(column=5, row=0, sticky="n", pady=(20, 0))
         D_gain.set(0)
 
         #setpoint
         set_point = tk.IntVar()
         ttk.Label(Frame, text="SP:").grid(row=0,column=6, sticky="ne", pady=(20, 0), padx=(20, 0))
-        ttk.Entry(Frame,textvariable=set_point, width=10, font=("segoeUI 10")).grid(column=7, row=0, sticky="n", pady=(20, 0))
+        ttk.Entry(Frame,textvariable=set_point, width=10, font=("segoe UI", 10)).grid(column=7, row=0, sticky="n", pady=(20, 0))
         set_point.set(0)
-
         #connectivity
         methods = ["BlueTooth", "WiFi", "Serial", "Http"]
         ttk.Label(Frame, text="CONNECTIVITY:").grid(row=0, column=8, sticky="n", pady=(20, 0), padx=(50, 0))
@@ -199,34 +195,45 @@ class Dashboard:
         baud.current(4)
         baud.bind("<<ComboboxSelected>>", lambda event: setattr(self, "baudrate", baud.get()))
         baud.grid(row=0, column=1, pady=10)
-        ports = ["COM3", "COM5","COM7", "COM9", "COM11"]
+        ports = [port.device for port in serial.tools.list_ports.comports()]
         ttk.Label(s_frame, text="COM PORT:").grid(row=1, column=0, pady=10, padx=20)
+
+
         port_c = ttk.Combobox(s_frame, values=ports, justify="center")
+
         port_c.bind("<<ComboboxSelected>>", lambda event: setattr(self, "port", port_c.get()))
-        port_c.current(0)
+        if ports:
+            port_c.current(0)
+            self.port = ports[0]
+        else:
+            port_c.set("No port available")
+            self.port = None
         port_c.grid(row=1, column=1, pady=10)
+        ttk.Button(s_frame, text="refresh", command=lambda frame = self.s_frame: self.serial_settings(frame)).grid(row=1, column=2, padx=10)
 
     def Wifi_settings(self, s_frame):
         for widget in s_frame.winfo_children():
             widget.destroy()
         ttk.Label(s_frame,text="wifi coming soon....", font=("segoe ui" ,12)).pack(side="top")
 
+
     def bluetooth_settings(self, s_frame):
             for widget in s_frame.winfo_children():
                 widget.destroy()
             ttk.Label(s_frame,text=" bluetooth coming soon....", font=("segoe ui" ,12)).pack(side="top")
 
+
     def http_settings(self, s_frame):
           for widget in s_frame.winfo_children():
                 widget.destroy()
           ttk.Label(s_frame,text="http coming soon....", font=("segoe ui" ,12)).pack(side="top")
+
     def start(self):
         if self.connectivity_setting == "Serial":
-            time.sleep(1)
             self.yarr.clear()
             self.tarr.clear()
-            self.update_graph()
             self.running = True
+            self.update_graph()
             threading.Thread(target=self.serial_update_data, daemon=True).start()
 
 
@@ -241,8 +248,11 @@ class Dashboard:
                 while self.running:
                     max_points = 2000
                     if self.mcu:
-                        data = self.mcu.readline().decode('utf-8').strip()
-                        time.sleep(0.01)
+                        try:
+                            data = self.mcu.readline().decode('utf-8').strip()
+                            time.sleep(0.1)
+                        except serial.SerialException:
+                            break
                         try:
                             parts = data.split(",")
                             if len(parts) == 2:
@@ -252,7 +262,6 @@ class Dashboard:
                                 self.tarr.pop(0)
                                 self.yarr.pop(0)
 
-
                         except ValueError:
                             pass
             else:
@@ -260,9 +269,10 @@ class Dashboard:
                 messagebox.showinfo("port", serial.SerialException)
 
         except Exception as e:
-            self.mcu.close()
+            if hasattr(self, "mcu") and self.mcu.is_open:
+                self.mcu.close()
             # messagebox.showerror("Error","Something went wrong!")
-            messagebox.showerror("error",e)
+            messagebox.showerror("error",str(e))
 
     def stop(self):
         self.running = False
@@ -319,6 +329,7 @@ class Dashboard:
             rise_time_val = 0
 
 
+
         steady_state_val = abs(y[-1] - sp)
 
         peak_time_val = t[y.index(max_val)]
@@ -334,7 +345,6 @@ class Dashboard:
         for widget in self.d_frame.winfo_children():
             widget.destroy()
 
-
         self.var_overshoot = tk.StringVar(value=f"{overshoot_val:.2f}")
         self.var_rise_time = tk.StringVar(value=f"{rise_time_val:.2f}")
         self.var_steady_state = tk.StringVar(value=f"{steady_state_val:.2f}")
@@ -347,7 +357,7 @@ class Dashboard:
 
         for i, (text, var) in enumerate(zip(labels, vars_)):
             ttk.Label(self.d_frame, text=text).grid(row=i, column=0, padx=(50, 0), pady=(5, 0))
-            ttk.Entry(self.d_frame, textvariable=var, state="readonly").grid(row=i, column=1, pady=(5, 0))
+            ttk.Entry(self.d_frame,state="readonly", textvariable=var).grid(row=i, column=1, pady=(5, 0))
 
     def config(self, frame, kp, ki, kd, sp):
         self.P_gain = kp.get()
@@ -359,9 +369,7 @@ class Dashboard:
         else:
             messagebox.showerror("config", "no mcu available")
 
-    def setup(self):
-        # try:
-        pass
+
 
 if __name__ == "__main__":
     dashboard = Dashboard("abel")
