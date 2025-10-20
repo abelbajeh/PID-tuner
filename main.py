@@ -7,9 +7,9 @@ from matplotlib.ticker import MultipleLocator
 import threading
 import serial
 from tkinter import messagebox
-
-
-
+import serial.tools.list_ports
+import websocket
+import json
 class Dashboard:
     def __init__(self, name):
         self.name = name
@@ -23,7 +23,8 @@ class Dashboard:
         self.S_point = 0
         self.yarr = []
         self.tarr = []
-        self.port = "COM3"
+        self.port = None
+        self.max_points = 2000
         self.baudrate = "9600"
         self.connectivity_setting = "Serial"
         self.running = False
@@ -43,12 +44,9 @@ class Dashboard:
         style.map('Custom2.TButton', background=[("active", "darkorange"), ("!active", "orange")],
                   foreground=[("pressed", "yellow"), ("active", "white")])
         self.control_panel()
-
-
-
         self.dashboard.mainloop()
 
-    def control_panel(self)-> None:
+    def control_panel(self) -> None:
         Frame = ttk.LabelFrame(self.dashboard,text="PID CONTROL", borderwidth=2, relief="solid", height=100)
         Frame.pack(side="top", fill="x")
         Frame.pack_propagate(False)
@@ -59,36 +57,35 @@ class Dashboard:
         #proportional
         P_gain = tk.IntVar()
         ttk.Label(Frame, text="KP:").grid(row=0,column=0, sticky="nw", pady=(20, 0), padx=(10, 0))
-        ttk.Entry(Frame,textvariable=P_gain, width=10, font=("segoeUI 10")).grid(column=1, row=0,sticky="n", pady=(20, 0))
+        ttk.Entry(Frame,textvariable=P_gain, width=10, font=("segoe UI", 10)).grid(column=1, row=0,sticky="n", pady=(20, 0))
         P_gain.set(0)
 
 
         #INTEGRAL
         I_gain = tk.IntVar()
         ttk.Label(Frame, text="KI:").grid(row=0,column=2, sticky="nw", pady=(20, 0), padx=(20, 0))
-        ttk.Entry(Frame,textvariable=I_gain, width=10, font=("segoeUI 10")).grid(column=3, row=0, sticky="n", pady=(20, 0) )
+        ttk.Entry(Frame,textvariable=I_gain, width=10, font=("segoe UI", 10)).grid(column=3, row=0, sticky="n", pady=(20, 0) )
         I_gain.set(0)
 
 
         #INTEGRAL
         D_gain = tk.IntVar()
         ttk.Label(Frame, text="KD:").grid(row=0,column=4, sticky="n", pady=(20, 0), padx=(20, 0))
-        ttk.Entry(Frame,textvariable=D_gain, width=10, font=("segoeUI 10")).grid(column=5, row=0, sticky="n", pady=(20, 0))
+        ttk.Entry(Frame,textvariable=D_gain, width=10, font=("segoe UI", 10)).grid(column=5, row=0, sticky="n", pady=(20, 0))
         D_gain.set(0)
 
         #setpoint
         set_point = tk.IntVar()
         ttk.Label(Frame, text="SP:").grid(row=0,column=6, sticky="ne", pady=(20, 0), padx=(20, 0))
-        ttk.Entry(Frame,textvariable=set_point, width=10, font=("segoeUI 10")).grid(column=7, row=0, sticky="n", pady=(20, 0))
+        ttk.Entry(Frame,textvariable=set_point, width=10, font=("segoe UI", 10)).grid(column=7, row=0, sticky="n", pady=(20, 0))
         set_point.set(0)
-
         #connectivity
-        methods = ["BlueTooth", "WiFi", "Serial", "Http"]
+        methods = ["Serial",  "WLAN", "BlueTooth", "Cloud Websocket"]
         ttk.Label(Frame, text="CONNECTIVITY:").grid(row=0, column=8, sticky="n", pady=(20, 0), padx=(50, 0))
         connection = ttk.Combobox(Frame, values=methods)
         connection.grid(row=0, column=9, sticky="n", pady=(20, 0), padx=(20, 0))
-        connection.current(2)
-        connection.bind("<<ComboboxSelected>>", lambda event: [setattr(self, "connectivity_setting", connection.get()),self.show_setting(self.s_frame,connection.get())])
+        connection.current(0)
+        connection.bind("<<ComboboxSelected>>", lambda event: [setattr(self, "connectivity_setting", connection.get()),self.show_setting(self.s_frame,connection.get()), self.stop()])
 
         #configure
         ttk.Button(Frame, text="CONFIG", state="active", command=lambda frame=Frame, kp=P_gain, ki=I_gain, kd=D_gain, sp=set_point : self.config(frame, kp, ki, kd,sp)).grid(row=0, column=10, sticky="e", padx=(20, 0),pady=(10,0))
@@ -168,12 +165,12 @@ class Dashboard:
     def show_setting(self,frame, connectivity):
         if connectivity == "Serial":
             self.serial_settings(frame)
-        if connectivity == "WiFi":
-            self.Wifi_settings(frame)
+        if connectivity == "WLAN":
+            self.WLAN_settings(frame)
         if connectivity == "BlueTooth":
             self.bluetooth_settings(frame)
-        if connectivity == "Http":
-            self.http_settings(frame)
+        if connectivity == "Cloud Websocket":
+            self.Cloud_Websocket_settings(frame)
 
     def serial_settings(self, s_frame):
         for widgets in s_frame.winfo_children():
@@ -199,35 +196,58 @@ class Dashboard:
         baud.current(4)
         baud.bind("<<ComboboxSelected>>", lambda event: setattr(self, "baudrate", baud.get()))
         baud.grid(row=0, column=1, pady=10)
-        ports = ["COM3", "COM5","COM7", "COM9", "COM11"]
+        ports = [port.device for port in serial.tools.list_ports.comports()]
         ttk.Label(s_frame, text="COM PORT:").grid(row=1, column=0, pady=10, padx=20)
-        port_c = ttk.Combobox(s_frame, values=ports, justify="center")
-        port_c.bind("<<ComboboxSelected>>", lambda event: setattr(self, "port", port_c.get()))
-        port_c.current(0)
-        port_c.grid(row=1, column=1, pady=10)
 
-    def Wifi_settings(self, s_frame):
+
+        port_c = ttk.Combobox(s_frame, values=ports, justify="center")
+
+        port_c.bind("<<ComboboxSelected>>", lambda event: setattr(self, "port", port_c.get()))
+        if ports:
+            port_c.current(0)
+            self.port = ports[0]
+        else:
+            port_c.set("No port available")
+            self.port = None
+        port_c.grid(row=1, column=1, pady=10)
+        ttk.Button(s_frame, text="refresh", command=lambda frame = self.s_frame: self.serial_settings(frame)).grid(row=1, column=2, padx=10)
+
+    def WLAN_settings(self, s_frame):
         for widget in s_frame.winfo_children():
             widget.destroy()
-        ttk.Label(s_frame,text="wifi coming soon....", font=("segoe ui" ,12)).pack(side="top")
+        ttk.Label(s_frame,text= "IP address:", font=("segoe ui" ,10)).grid(row=0, column=0, padx=30, pady=10)
+        ttk.Entry(s_frame, font=("segoe ui", 10)).grid(row=0, column=1)
+        self.wifi_connect = tk.Button(s_frame, text="CONNECT", bg="gray", fg="white", command=self.wlan_connect)
+        self.wifi_connect.place(x=150,y=130)
 
     def bluetooth_settings(self, s_frame):
             for widget in s_frame.winfo_children():
                 widget.destroy()
             ttk.Label(s_frame,text=" bluetooth coming soon....", font=("segoe ui" ,12)).pack(side="top")
 
-    def http_settings(self, s_frame):
+
+    def Cloud_Websocket_settings(self, s_frame):
           for widget in s_frame.winfo_children():
                 widget.destroy()
-          ttk.Label(s_frame,text="http coming soon....", font=("segoe ui" ,12)).pack(side="top")
+          ttk.Label(s_frame,text="Cloud websocket coming soon....", font=("segoe ui" ,12)).pack(side="top")
+
     def start(self):
         if self.connectivity_setting == "Serial":
-            time.sleep(1)
+            self.stop()
             self.yarr.clear()
             self.tarr.clear()
             self.running = True
-            threading.Thread(target=self.serial_update_data, daemon=True).start()
             self.update_graph()
+            threading.Thread(target=self.serial_update_data, daemon=True).start()
+        elif self.connectivity_setting == "WLAN":
+            self.stop()
+            self.yarr.clear()
+            self.tarr.clear()
+            self.running = True
+            self.update_graph()
+            threading.Thread(target=self.wlan_update_data, daemon=True).start()
+
+
 
 
 
@@ -238,19 +258,20 @@ class Dashboard:
             if self.mcu.is_open:
                 self.start_button.config(style="Custom.TButton")
                 while self.running:
-                    max_points = 2000
                     if self.mcu:
-                        data = self.mcu.readline().decode('utf-8').strip()
-                        time.sleep(0.01)
+                        try:
+                            data = self.mcu.readline().decode('utf-8').strip()
+                            time.sleep(0.1)
+                        except serial.SerialException:
+                            break
                         try:
                             parts = data.split(",")
                             if len(parts) == 2:
                                 self.yarr.append(float(parts[1]))
                                 self.tarr.append(float(parts[0]))
-                            if len(self.tarr) > max_points:
+                            if len(self.tarr) > self.max_points:
                                 self.tarr.pop(0)
                                 self.yarr.pop(0)
-
 
                         except ValueError:
                             pass
@@ -259,15 +280,64 @@ class Dashboard:
                 messagebox.showinfo("port", serial.SerialException)
 
         except Exception as e:
-            self.mcu.close()
+            if hasattr(self, "mcu") and self.mcu.is_open:
+                self.mcu.close()
             # messagebox.showerror("Error","Something went wrong!")
-            messagebox.showerror("error",e)
+            messagebox.showerror("error",str(e))
+
+    def wlan_update_data(self):
+            try:
+                if self.ws_is_connected():
+                    self.start_button.config(style="Custom.TButton")
+                    while self.running:
+                        data = self.ws.recv()
+                        parts = data.split(",")
+                        if len(parts) == 2:
+                            self.tarr.append(float(parts[0]))
+                            self.yarr.append(float(parts[1]))
+                        if len(self.tarr) == self.max_points:
+                            self.tarr.pop(0)
+                            self.yarr.pop(0)
+
+            except Exception as e:
+                messagebox.showerror("websocket error", str(e))
+
+
+    def wlan_connect(self):
+        try:
+            if not self.ws_is_connected():
+                ip_entry = self.s_frame.winfo_children()[1]
+                ip_address = ip_entry.get()
+                if not ip_address:
+                    messagebox.showerror("WLAN", "Enter MCU IP address")
+                    return
+                ws_URL = f"ws://{ip_address}:81/"
+
+                try:
+                    self.ws = websocket.WebSocket()
+                    self.ws.connect(ws_URL)
+                    self.wifi_connect.config(bg="green", text="Disconnect")
+
+                except Exception as e:
+                    messagebox.showerror("WLAN", str(e))
+            elif self.ws_is_connected():
+                self.stop()
+                self.wifi_connect.config(bg="gray", text="Connect")
+
+
+        except Exception as e:
+            messagebox.showerror("WLAN", str(e))
+
+    def ws_is_connected(self):
+        return hasattr(self, "ws") and self.ws.sock
 
     def stop(self):
         self.running = False
         self.start_button.config(style="TButton")
-        if hasattr(self, "mcu") and self.mcu.is_open:
-            self.mcu.close()
+        if self.connectivity_setting == "Serial":
+            if hasattr(self, "mcu") and self.mcu.is_open:
+                self.mcu.close()
+
 
     def update_graph(self):
         if not self.running:
@@ -318,6 +388,7 @@ class Dashboard:
             rise_time_val = 0
 
 
+
         steady_state_val = abs(y[-1] - sp)
 
         peak_time_val = t[y.index(max_val)]
@@ -333,7 +404,6 @@ class Dashboard:
         for widget in self.d_frame.winfo_children():
             widget.destroy()
 
-
         self.var_overshoot = tk.StringVar(value=f"{overshoot_val:.2f}")
         self.var_rise_time = tk.StringVar(value=f"{rise_time_val:.2f}")
         self.var_steady_state = tk.StringVar(value=f"{steady_state_val:.2f}")
@@ -346,17 +416,24 @@ class Dashboard:
 
         for i, (text, var) in enumerate(zip(labels, vars_)):
             ttk.Label(self.d_frame, text=text).grid(row=i, column=0, padx=(50, 0), pady=(5, 0))
-            ttk.Entry(self.d_frame, textvariable=var, state="readonly").grid(row=i, column=1, pady=(5, 0))
+            ttk.Entry(self.d_frame,state="readonly", textvariable=var).grid(row=i, column=1, pady=(5, 0))
 
     def config(self, frame, kp, ki, kd, sp):
         self.P_gain = kp.get()
         self.I_gain = ki.get()
         self.D_gain = kd.get()
         self.S_point = sp.get()
-        if hasattr(self, "mcu") and self.mcu.is_open:
-            self.mcu.write(f"{self.P_gain}:{self.I_gain}:{self.D_gain}:{self.S_point}\n".encode())
-        else:
-            messagebox.showerror("config", "no mcu available")
+        if self.connectivity_setting == "Serial":
+            if hasattr(self, "mcu") and self.mcu.is_open:
+                self.mcu.write(f"{self.P_gain}:{self.I_gain}:{self.D_gain}:{self.S_point}\n".encode())
+            else:
+                messagebox.showerror("config", "no mcu available")
+        if self.connectivity_setting == "WLAN" and self.ws_is_connected():
+            PID = {"P":str(self.P_gain),
+                   "I":str(self.I_gain),
+                   "D":str(self.D_gain)}
+            self.ws.send(json.dumps(PID))
+
 
 
 
