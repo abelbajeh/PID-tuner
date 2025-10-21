@@ -84,7 +84,7 @@ class Dashboard:
         ttk.Label(Frame, text="CONNECTIVITY:").grid(row=0, column=8, sticky="n", pady=(20, 0), padx=(50, 0))
         connection = ttk.Combobox(Frame, values=methods)
         connection.grid(row=0, column=9, sticky="n", pady=(20, 0), padx=(20, 0))
-        connection.current(2)
+        connection.current(0)
         connection.bind("<<ComboboxSelected>>", lambda event: [setattr(self, "connectivity_setting", connection.get()),self.show_setting(self.s_frame,connection.get()), self.stop()])
 
         #configure
@@ -324,11 +324,12 @@ class Dashboard:
                 self.stop()
                 self.wifi_connect.config(bg="gray", text="Connect")
 
+
         except Exception as e:
             messagebox.showerror("WLAN", str(e))
 
     def ws_is_connected(self):
-        return hasattr(self, "ws") and self.ws.sock and self.ws.sock.connected
+        return hasattr(self, "ws") and self.ws.sock
 
     def stop(self):
         self.running = False
