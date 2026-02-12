@@ -1,6 +1,3 @@
-Perfect — here’s a **clean, professional `README.md`** written specifically for your PID Tuner Dashboard GUI code 👇
-
----
 
 ```markdown
 # ⚙️ PID Tuner Dashboard
