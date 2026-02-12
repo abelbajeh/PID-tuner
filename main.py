@@ -254,6 +254,7 @@ class Dashboard:
             self.update_graph()
             threading.Thread(target=self.wlan_update_data, daemon=True).start()
 
+
     def serial_update_data(self):
         try:
             self.mcu = serial.Serial(self.port, int(self.baudrate))
@@ -409,6 +410,7 @@ class Dashboard:
 
         except StopIteration:
             rise_time_val = "N/A"
+
 
         steady_state_val = abs(y[-1] - sp)
 
