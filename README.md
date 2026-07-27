@@ -39,7 +39,7 @@ To work with the dashboard, your device just needs to do two things: **accept co
 2. Have it reply to the sender's address once it receives any packet — that first packet (the dashboard sends a `"PING"`) is how your device learns where to send telemetry back to. This is a common pattern for devices that don't know their client's IP ahead of time (e.g. an ESP32 running its own access point).
 3. In the dashboard, select **UDP**, enter your device's IP and port, hit **CONNECT**, then **START**.
 
-*(WLAN/WebSocket and Bluetooth appear in the dropdown as placeholders for future transports and aren't implemented yet — use UDP or Serial today.)*
+*(WLAN/WebSocket and Bluetooth appear in the dropdown as placeholders for future transports and aren't implemented yet — see "Placeholder transports" below if you want to build one out. Use UDP or Serial today.)*
 
 ## Protocol
 
@@ -93,10 +93,34 @@ Hit **Analyze** after capturing a trace to compute:
 | Peak time | Time at which the max value occurs |
 | Settling time | Last time the response was outside a ±2% band around the setpoint |
 
+## Placeholder transports (open for contribution)
+
+Two entries in the CONNECTIVITY dropdown are stubs today — listed here so anyone picking this up knows exactly what's there and what's missing.
+
+### WLAN (WebSocket)
+
+Partially implemented — the wiring exists but there's no server to talk to.
+
+- `WLAN_settings()` (`dashboard.py`) renders an IP field and a Connect button.
+- `wlan_connect()` opens a `websocket.WebSocket()` and connects to `ws://<ip>:81/`.
+- `wlan_update_data()` reads frames via `self.ws.recv()` and expects the same `<time>,<value>` telemetry format as Serial/UDP.
+- `ws_is_connected()` / `config()`'s WLAN branch (sends PID gains as a JSON object `{"P":..., "I":..., "D":..., "s":...}`, not the comma-separated format used by Serial/UDP — worth reconciling if you build this out) are also already in place.
+
+**What's missing:** a device-side WebSocket server on port 81. This would suit a device with a full WiFi stack (e.g. connecting to a real router) rather than the UDP-over-access-point pattern used by the reference firmware. If you build this, either match the existing JSON config format or switch it to the shared comma-separated one for consistency.
+
+### Bluetooth
+
+Not implemented — `bluetooth_settings()` just renders a "coming soon" label. No connection logic, no data parsing. Would need a `bluetooth_connect()` (e.g. via `pybluez` or platform-specific serial-over-Bluetooth) plus a `bluetooth_update_data()` thread mirroring the Serial/UDP ones, ideally reusing the existing `_parse_frame()` telemetry parser and the comma-separated config format.
+
+### Cloud Websocket
+
+Not implemented — `Cloud_Websocket_settings()` is a placeholder label too. Intended for a device that phones home to a cloud relay (useful when the device and dashboard aren't on the same local network). Would need: a relay/broker service, a way to address a specific device (e.g. a device ID), and dashboard-side auth/connection handling in addition to the send/receive thread.
+
+If you implement any of these, the pattern to follow is the UDP option: a `*_settings()` panel, a `*_connect()`/`*_is_connected()` pair, a `*_update_data()` thread that pushes `(t, value)` tuples into `self.data_queue`, and hooking into `start()`/`stop()`'s `active_connection` tracking so START/STOP/switching-dropdowns behaves correctly.
+
 ## Known limitations / TODO
 
 - PID gains are currently truncated to integers before being sent (`int(kp)` etc.), even if your device treats them as floats. Fine for coarse tuning; flag if you need fractional gains and it can be relaxed to floats.
-- WLAN (WebSocket) and Bluetooth connectivity options are placeholders in the dropdown, not yet implemented.
 - Planned: a **Vibration Analysis** tab using raw accelerometer FFT, for scientifically picking a filter cutoff frequency instead of guessing (see TODO block at the bottom of `dashboard.py`).
 
 ## Safety (if driving motors/actuators)
