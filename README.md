@@ -1,86 +1,105 @@
 # PID Tuner Dashboard
 
-A Tkinter-based GUI for tuning a PID controller on an ESP32-based balancing rig, with live step-response plotting and step-response analysis (overshoot, rise time, settling time, etc).
+A general-purpose Tkinter GUI for tuning any PID controller over Serial or UDP/WiFi. It streams live process data into a step-response plot, computes step-response metrics (overshoot, rise time, settling time, etc), and pushes new PID gains to your device in real time.
 
-Talks to the rig over **Serial (USB)** or **UDP over WiFi** (the ESP32 runs its own WiFi access point — no router needed).
+The dashboard doesn't assume any specific hardware — it just needs your device to speak the small text protocol described below. `rig_firmware.ino` is included as a **reference implementation** for an ESP32 (MPU6050 + 2 ESCs), but you can point this dashboard at anything: an Arduino, an ESP32, an STM32, a simulated plant in Python, whatever — as long as it implements the protocol.
 
-## Files
+## Features
 
-| File | Description |
-|---|---|
-| `dashboard.py` | Python/Tkinter GUI — PID config, live plot, connectivity |
-| `rig_firmware.ino` | ESP32 firmware — reads MPU6050, runs PID, drives two ESCs |
-
-## Hardware
-
-- ESP32 dev board
-- MPU6050 (I2C, pins 21/22)
-- 2x ESC + motor on pins 18 (left) and 19 (right)
+- Live-updating step-response plot (efficient redraws, handles high sample rates without lagging)
+- Two built-in transports: **Serial (USB)** and **UDP (WiFi)**
+- One-click PID config push (`KP` / `KI` / `KD` / `SP`)
+- Step-response analysis: overshoot, rise time, steady-state error, peak time, settling time
+- COM port auto-detection and refresh for Serial
 
 ## Requirements
 
-**Python side:**
 ```bash
 pip install pyserial matplotlib websocket-client
 ```
 
-**Firmware side (Arduino IDE):**
-- Board: ESP32
-- Libraries: `ESP32Servo` (built-in `WiFi`, `WiFiUdp`, `Wire` are part of the ESP32 core)
+## Running it
 
-## Setup
-
-### 1. Flash the firmware
-Open `rig_firmware.ino` in the Arduino IDE, select your ESP32 board, and upload.
-
-On boot the ESP32:
-- Creates a WiFi access point: **SSID `TEST_RIG_003`**, **password `password123`**
-- Starts listening for UDP packets on **port 8888** at IP **`192.168.4.1`**
-- Arms the ESCs (keep the rig still for the first ~3 seconds after power-on — it beeps/arms during this window)
-
-### 2. Connect your computer to the rig's WiFi
-Join `TEST_RIG_003` from your laptop like any normal WiFi network. Your computer will get an address on the ESP32's subnet automatically.
-
-### 3. Run the dashboard
 ```bash
 python dashboard.py
 ```
 
-## Usage
+## Integrating your own device
 
-1. **Choose a connection method** from the CONNECTIVITY dropdown:
-   - **Serial** — plug the ESP32 in over USB, pick the COM port and baud rate (default `9600`), no extra setup needed.
-   - **UDP** — leave IP as `192.168.4.1` and port as `8888` (defaults match the firmware), then hit **CONNECT**. This sends a one-time "PING" so the ESP32 learns where to send data back to.
-2. Hit **START** to begin streaming live angle data into the plot.
-3. Enter `KP`, `KI`, `KD`, `SP` (setpoint) and hit **CONFIG** to push new gains to the rig live.
-4. Setting all of `KP`/`KI`/`KD` to `0` is a kill switch — the firmware cuts the motors to idle.
-5. Hit **STOP** to end the stream (closes the Serial/UDP connection).
-6. Hit **Analyze** to compute overshoot, rise time, steady-state error, peak time, and settling time from the captured trace.
-7. Hit **Clear** to wipe the current trace and start fresh.
+To work with the dashboard, your device just needs to do two things: **accept config messages**, and **send back telemetry**. Pick whichever transport fits your setup.
 
-## Wire protocol
+### Option A: Serial (USB)
 
-**Dashboard → rig (PID config):**
+1. Have your device print one line per sample over Serial at a known baud rate.
+2. In the dashboard, select **Serial** in the CONNECTIVITY dropdown, choose your COM port and baud rate, and hit **START**.
+
+### Option B: UDP (WiFi)
+
+1. Have your device open a UDP listener on a known port (e.g. `8888`).
+2. Have it reply to the sender's address once it receives any packet — that first packet (the dashboard sends a `"PING"`) is how your device learns where to send telemetry back to. This is a common pattern for devices that don't know their client's IP ahead of time (e.g. an ESP32 running its own access point).
+3. In the dashboard, select **UDP**, enter your device's IP and port, hit **CONNECT**, then **START**.
+
+*(WLAN/WebSocket and Bluetooth appear in the dropdown as placeholders for future transports and aren't implemented yet — use UDP or Serial today.)*
+
+## Protocol
+
+### Dashboard → device (PID config)
+
+Sent whenever you hit **CONFIG**, over whichever transport is active:
+
 ```
 kp,ki,kd,setpoint\n
 ```
-Sent over whichever channel (Serial or UDP) is currently active.
 
-**Rig → dashboard (telemetry):**
-Currently the firmware sends a bare angle value with no timestamp:
-- Serial: `Angle:<value>\n`
-- UDP: `<value>\n`
+All four values are sent as plain numbers, comma-separated, newline-terminated. Your device should parse this and update its control loop. Setting all three gains to `0` is treated as a natural kill-switch convention if you want to support it (the reference firmware does).
 
-The dashboard timestamps each sample locally (wall-clock time since STOP/START) since the firmware doesn't include its own time field yet. If the firmware is ever updated to send `time,angle` pairs directly, the dashboard's parser already supports that format too, no changes needed on the Python side.
+### Device → dashboard (telemetry)
+
+The dashboard's parser is intentionally flexible and accepts **either** of these formats, so you can start with the simple one and upgrade later without touching the Python side:
+
+**Simple (no timestamp) — recommended for a first integration:**
+```
+<value>\n
+```
+A single number, e.g. your sensor reading. The dashboard timestamps each sample itself using wall-clock time from when you hit START. An optional `Angle:` prefix (e.g. `Angle:12.34`) is also stripped automatically if present, for compatibility with quick debug prints.
+
+**Full (with timestamp):**
+```
+<time>,<value>\n
+```
+Two comma-separated numbers. Use this once you want your device's own clock driving the x-axis (e.g. for precise timing independent of network/serial latency).
+
+Send telemetry as often as makes sense for your control loop — the dashboard drains everything available each redraw tick, so it won't fall behind a fast stream.
+
+## Reference implementation
+
+`rig_firmware.ino` is a complete example targeting an ESP32 balancing rig (MPU6050 + 2 ESCs on pins 18/19), implementing both the UDP transport and the protocol above. Use it as a template:
+
+- It opens a WiFi access point and a UDP socket on port 8888
+- It parses incoming `kp,ki,kd,setpoint` messages
+- It sends telemetry using the "simple" (no-timestamp) format
+
+Swap out the sensor-reading and motor-driving code for your own hardware and the rest should work as-is.
+
+## Step-response analysis
+
+Hit **Analyze** after capturing a trace to compute:
+
+| Metric | Meaning |
+|---|---|
+| Overshoot | How far the response exceeds the setpoint |
+| Rise time | Time to go from 10% to 90% of the step change |
+| Steady-state error | Final offset from the setpoint |
+| Peak time | Time at which the max value occurs |
+| Settling time | Last time the response was outside a ±2% band around the setpoint |
 
 ## Known limitations / TODO
 
-- PID gains are currently truncated to integers before being sent (`int(kp)` etc. in `config()`), even though the firmware treats them as floats. Fine for coarse tuning, but you'll want that fixed if you need fractional gains.
-- WLAN (WebSocket) connectivity option in the dropdown is a placeholder for a future firmware variant — the current firmware doesn't run a WebSocket server, so use **UDP** instead for WiFi.
-- Bluetooth and Cloud Websocket options are not implemented yet.
-- Planned: a **Vibration Analysis** tab using raw accelerometer FFT to pick the complementary filter cutoff frequency scientifically instead of guessing (see TODO block at the bottom of `dashboard.py`).
+- PID gains are currently truncated to integers before being sent (`int(kp)` etc.), even if your device treats them as floats. Fine for coarse tuning; flag if you need fractional gains and it can be relaxed to floats.
+- WLAN (WebSocket) and Bluetooth connectivity options are placeholders in the dropdown, not yet implemented.
+- Planned: a **Vibration Analysis** tab using raw accelerometer FFT, for scientifically picking a filter cutoff frequency instead of guessing (see TODO block at the bottom of `dashboard.py`).
 
-## Safety
+## Safety (if driving motors/actuators)
 
-- Always keep the rig secured/restrained during testing — the ESC arming sequence and PID output can spin the motors unexpectedly.
-- Motor PWM is clamped to a safe testing range (1000–1500µs) in firmware regardless of what gains are sent.
+- Always secure/restrain hardware under test before sending live PID output to actuators.
+- Clamp actuator output to a safe range in your device's firmware regardless of what gains get sent — don't rely on the dashboard to enforce this.
