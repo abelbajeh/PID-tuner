@@ -11,6 +11,7 @@ from tkinter import messagebox
 import serial.tools.list_ports
 import websocket
 import json
+import socket
 
 
 class Dashboard:
@@ -33,6 +34,20 @@ class Dashboard:
         self.baudrate = "9600"
         self.connectivity_setting = "Serial"
         self.running = False
+        # UDP state (used by the new "UDP" connectivity option)
+        self.udp_sock = None
+        self.udp_remote = None
+        self.udp_connected = False
+        # Tracks which connection is actually live, independent of whatever
+        # self.connectivity_setting currently is. Needed because the
+        # connectivity combobox switches self.connectivity_setting *before*
+        # calling stop(), so stop() used to close the wrong connection type
+        # when you switched dropdowns mid-run.
+        self.active_connection = None
+        # Local wall-clock reference used to generate the x-axis timestamp,
+        # since the current (unmodified) firmware only sends a bare angle
+        # value with no time field of its own.
+        self.stream_start_time = None
         self.show_dashboard()
 
     def show_dashboard(self):
@@ -85,7 +100,7 @@ class Dashboard:
                                                                                        pady=(20, 0))
         set_point.set("0")
         # connectivity
-        methods = ["Serial", "WLAN", "BlueTooth", "Cloud Websocket"]
+        methods = ["Serial", "UDP", "WLAN", "BlueTooth", "Cloud Websocket"]
         ttk.Label(Frame, text="CONNECTIVITY:").grid(row=0, column=8, sticky="n", pady=(20, 0), padx=(50, 0))
         connection = ttk.Combobox(Frame, values=methods)
         connection.grid(row=0, column=9, sticky="n", pady=(20, 0), padx=(20, 0))
@@ -158,8 +173,11 @@ class Dashboard:
         # self.ax.yaxis.set_major_locator(MultipleLocator(0.1))
         # self.ax.xaxis.set_major_locator(MultipleLocator(0.1))
         self.ax.grid(True)
-        x = []
-        y = []
+
+        # PERF: create the Line2D object once and just mutate its data on every
+        # update instead of clearing + re-plotting the whole axes each tick.
+        # This is the single biggest win for smoothness at high sample rates.
+        (self.line,) = self.ax.plot([], [], color="blue", marker=".")
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=frame)
         self.canvas.draw()
@@ -170,6 +188,8 @@ class Dashboard:
     def show_setting(self, frame, connectivity):
         if connectivity == "Serial":
             self.serial_settings(frame)
+        if connectivity == "UDP":
+            self.UDP_settings(frame)
         if connectivity == "WLAN":
             self.WLAN_settings(frame)
         if connectivity == "BlueTooth":
@@ -218,6 +238,28 @@ class Dashboard:
                                                                                                                  column=2,
                                                                                                                  padx=10)
 
+    def UDP_settings(self, s_frame):
+        # This talks directly to the ESP32's WiFiUDP "mailbox" on port 8888 -
+        # matches the firmware, unlike the WebSocket-based WLAN option below
+        # (which needs a websocket server the ESP32 doesn't run).
+        for widget in s_frame.winfo_children():
+            widget.destroy()
+        ttk.Label(s_frame, text="ESP32 IP address:", font=("segoe ui", 10)).grid(row=0, column=0, padx=20, pady=10)
+        ip_entry = ttk.Entry(s_frame, font=("segoe ui", 10))
+        ip_entry.insert(0, "192.168.4.1")  # default softAP address from the firmware
+        ip_entry.grid(row=0, column=1, pady=10)
+
+        ttk.Label(s_frame, text="UDP Port:", font=("segoe ui", 10)).grid(row=1, column=0, padx=20, pady=10)
+        port_entry = ttk.Entry(s_frame, font=("segoe ui", 10))
+        port_entry.insert(0, "8888")
+        port_entry.grid(row=1, column=1, pady=10)
+
+        self.udp_ip_entry = ip_entry
+        self.udp_port_entry = port_entry
+
+        self.udp_connect_btn = tk.Button(s_frame, text="CONNECT", bg="gray", fg="white", command=self.udp_connect)
+        self.udp_connect_btn.grid(row=2, column=0, columnspan=2, pady=10)
+
     def WLAN_settings(self, s_frame):
         for widget in s_frame.winfo_children():
             widget.destroy()
@@ -239,18 +281,35 @@ class Dashboard:
     def start(self):
         while not self.data_queue.empty():
             self.data_queue.get()
+        # Reference point for the locally-generated timestamp in
+        # _parse_frame() (needed since the current firmware doesn't send
+        # its own time field).
+        self.stream_start_time = time.time()
         if self.connectivity_setting == "Serial":
             self.stop()
             self.yarr.clear()
             self.tarr.clear()
             self.running = True
+            self.active_connection = "Serial"
             self.update_graph()
             threading.Thread(target=self.serial_update_data, daemon=True).start()
+        elif self.connectivity_setting == "UDP":
+            if not self.udp_is_connected():
+                messagebox.showerror("UDP", "Connect to the ESP32 first")
+                return
+            self.clear()
+            self.yarr.clear()
+            self.tarr.clear()
+            self.running = True
+            self.active_connection = "UDP"
+            self.update_graph()
+            threading.Thread(target=self.udp_update_data, daemon=True).start()
         elif self.connectivity_setting == "WLAN":
             self.clear()
             self.yarr.clear()
             self.tarr.clear()
             self.running = True
+            self.active_connection = "WLAN"
             self.update_graph()
             threading.Thread(target=self.wlan_update_data, daemon=True).start()
 
@@ -268,13 +327,9 @@ class Dashboard:
                             time.sleep(0.1)
                         except serial.SerialException:
                             break
-                        try:
-                            parts = data.split(",")
-                            if len(parts) == 2:
-                                self.data_queue.put((float(parts[0]), float(parts[1])))
-
-                        except ValueError:
-                            pass
+                        frame = self._parse_frame(data)
+                        if frame is not None:
+                            self.data_queue.put(frame)
             else:
                 self.mcu.close()
                 messagebox.showinfo("port", "no mcu")
@@ -298,6 +353,27 @@ class Dashboard:
                         self.data_queue.put_nowait((float(parts[0]), float(parts[1])))
         except Exception as e:
             messagebox.showerror("websocket error", str(e))
+
+    def udp_update_data(self):
+        try:
+            if self.udp_is_connected():
+                self.start_button.config(style="Custom.TButton")
+                while self.running:
+                    try:
+                        data, addr = self.udp_sock.recvfrom(1024)
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+                    text = data.decode("utf-8", errors="ignore").strip()
+                    frame = self._parse_frame(text)
+                    if frame is not None:
+                        try:
+                            self.data_queue.put_nowait(frame)
+                        except queue.Full:
+                            pass
+        except Exception as e:
+            messagebox.showerror("UDP error", str(e))
 
     def wlan_connect(self):
         try:
@@ -324,57 +400,167 @@ class Dashboard:
         except Exception as e:
             messagebox.showerror("WLAN", str(e))
 
+    def udp_connect(self):
+        try:
+            if not self.udp_is_connected():
+                ip = self.udp_ip_entry.get().strip()
+                if not ip:
+                    messagebox.showerror("UDP", "Enter ESP32 IP address")
+                    return
+                try:
+                    port = int(self.udp_port_entry.get().strip())
+                except ValueError:
+                    messagebox.showerror("UDP", "Port must be a number")
+                    return
+
+                self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                # Timeout lets the receive loop wake up periodically to check
+                # self.running instead of blocking forever on recvfrom().
+                self.udp_sock.settimeout(1.0)
+                self.udp_remote = (ip, port)
+
+                # The firmware only learns our IP/port (remoteIP/remotePort)
+                # once it *receives* a packet from us - it explicitly ignores
+                # a "PING" payload when parsing PID gains, so this is safe to
+                # send before any real config has been set.
+                self.udp_sock.sendto(b"PING", self.udp_remote)
+
+                self.udp_connected = True
+                self.udp_connect_btn.config(bg="green", text="Disconnect")
+            else:
+                # stop() only closes the socket if data acquisition is the
+                # thing currently running (active_connection == "UDP"). You
+                # can be "connected" without having pressed START yet, so
+                # close it here explicitly too.
+                self.stop()
+                if self.udp_sock:
+                    try:
+                        self.udp_sock.close()
+                    except OSError:
+                        pass
+                self.udp_sock = None
+                self.udp_connected = False
+                self.udp_connect_btn.config(bg="gray", text="Connect")
+        except Exception as e:
+            messagebox.showerror("UDP", str(e))
+
+    def udp_is_connected(self):
+        return bool(self.udp_connected and self.udp_sock)
+
     def ws_is_connected(self):
         return hasattr(self, "ws") and self.ws.sock
 
     def stop(self):
         self.running = False
         self.start_button.config(style="TButton")
-        if self.connectivity_setting == "Serial":
+        # BUGFIX: use active_connection (what's actually running) rather than
+        # connectivity_setting, which the dropdown handler already switches
+        # to the *new* choice before calling stop(). That mismatch used to
+        # mean switching dropdowns mid-run left the real connection open.
+        if self.active_connection == "Serial":
             if hasattr(self, "mcu") and self.mcu and self.mcu.is_open:
                 self.mcu.close()
-        elif self.connectivity_setting == "WLAN":
+        elif self.active_connection == "UDP":
+            if self.udp_sock:
+                try:
+                    self.udp_sock.close()
+                except OSError:
+                    pass
+            self.udp_sock = None
+            self.udp_connected = False
+        elif self.active_connection == "WLAN":
             if hasattr(self, "ws") and self.ws.sock:
                 self.ws.close()
+        self.active_connection = None
 
     def update_graph(self):
         if not self.running:
             return
-        self.process_queue()
-        self.ax.cla()
-        self.ax.set_title("STEP RESPONSE")
-        self.ax.set_xlabel("Time")
-        self.ax.set_ylabel("Amplitude")
-        self.ax.grid(True)
-        if self.yarr != None and self.tarr != None:
-            y_copy = self.yarr.copy()
-            t_copy = self.tarr.copy()
-            self.ax.plot(list(t_copy), list(y_copy), color="blue", marker=".")
-        self.canvas.draw()
+
+        # PERF: drain everything currently sitting in the queue instead of
+        # pulling a single point per 50ms tick. If the MCU/websocket sends
+        # data faster than our redraw rate, a single-point drain makes the
+        # queue back up and the plot visibly lags behind real time.
+        got_new_data = self.process_queue()
+
+        if got_new_data:
+            # PERF: mutate the existing line's data instead of ax.cla() +
+            # re-plot + re-set title/labels/grid every tick. cla() throws
+            # away all the axes styling and forces a full re-render; set_data
+            # just updates the line's vertices.
+            self.line.set_data(self.tarr, self.yarr)
+
+            # Rescale the view to fit the new data, then redraw only what's
+            # needed. relim()/autoscale_view() are cheap compared to a full
+            # cla()+replot, and draw_idle() lets matplotlib coalesce redraw
+            # requests instead of forcing an immediate full render.
+            self.ax.relim()
+            self.ax.autoscale_view()
+            self.canvas.draw_idle()
+
         self.dashboard.after(50, self.update_graph)
 
-    def process_queue(self):
+    def _parse_frame(self, text):
+        """Turn one line/packet from the rig into a (t, angle) tuple, or
+        None if it's not data (e.g. a boot message).
+
+        FIRMWARE-SIDE TODAY (unmodified):
+          - Serial sends "Angle:174.32"
+          - UDP sends "174.32" (bare, no comma, no time field)
+        Neither includes a time value, so we stamp each sample with our own
+        wall-clock time relative to when the stream started.
+
+        Also tolerates a future firmware sending "time,angle" pairs
+        directly, so this doesn't need touching again once that's fixed.
+        """
+        if text.startswith("Angle:"):
+            text = text[len("Angle:"):]
+        text = text.strip()
+        if not text:
+            return None
+
+        parts = text.split(",")
         try:
-            t_val, y_val = self.data_queue.get_nowait()
+            if len(parts) == 2:
+                return float(parts[0]), float(parts[1])
+            elif len(parts) == 1:
+                angle = float(parts[0])
+                t = time.time() - (self.stream_start_time or time.time())
+                return t, angle
+        except ValueError:
+            return None
+        return None
+
+    def process_queue(self):
+        """Pull every point currently available in the queue.
+
+        Returns True if at least one new point was added, so the caller
+        knows whether a redraw is actually needed.
+        """
+        got_new_data = False
+        while True:
+            try:
+                t_val, y_val = self.data_queue.get_nowait()
+            except queue.Empty:
+                break
             self.yarr.append(y_val)
             self.tarr.append(t_val)
-            if len(self.tarr) > self.max_points:
-                self.yarr.pop(0)
-                self.tarr.pop(0)
-        except queue.Empty:
-            pass
+            got_new_data = True
+        if len(self.tarr) > self.max_points:
+            overflow = len(self.tarr) - self.max_points
+            del self.tarr[:overflow]
+            del self.yarr[:overflow]
+        return got_new_data
 
     def clear(self):
         self.tarr.clear()
         self.yarr.clear()
-        self.ax.cla()
         if hasattr(self, "mcu") and self.mcu and self.mcu.is_open:
             self.mcu.reset_input_buffer()
-        self.ax.set_title("STEP RESPONSE")
-        self.ax.set_xlabel("Time")
-        self.ax.set_ylabel("Amplitude")
-        self.ax.grid(True)
-        self.canvas.draw()
+        # PERF: no need to cla()/re-set title/labels/grid, just clear the
+        # line's data and redraw.
+        self.line.set_data([], [])
+        self.canvas.draw_idle()
         print(self.yarr)
 
     def analyze(self):
@@ -426,11 +612,18 @@ class Dashboard:
         for widget in self.d_frame.winfo_children():
             widget.destroy()
 
-        self.var_overshoot = tk.StringVar(value=f"{overshoot_val:.2f}")
-        self.var_rise_time = tk.StringVar(value=f"{rise_time_val:.2f}")
-        self.var_steady_state = tk.StringVar(value=f"{steady_state_val:.2f}")
-        self.var_peak_time = tk.StringVar(value=f"{peak_time_val:.2f}")
-        self.var_settling_time = tk.StringVar(value=f"{settling_val:.2f}")
+        # BUGFIX: rise_time_val can be the string "N/A" (when the response
+        # never crosses the 10%/90% thresholds). Formatting a string with
+        # ":.2f" raises a ValueError, so format numbers and strings
+        # differently instead of assuming everything is a float.
+        def fmt(val):
+            return f"{val:.2f}" if isinstance(val, (int, float)) else str(val)
+
+        self.var_overshoot = tk.StringVar(value=fmt(overshoot_val))
+        self.var_rise_time = tk.StringVar(value=fmt(rise_time_val))
+        self.var_steady_state = tk.StringVar(value=fmt(steady_state_val))
+        self.var_peak_time = tk.StringVar(value=fmt(peak_time_val))
+        self.var_settling_time = tk.StringVar(value=fmt(settling_val))
 
         labels = ["Overshoot:", "Rise time:", "Steady-State Error:", "Peak Time:", "Settling Time:"]
         vars_ = [self.var_overshoot, self.var_rise_time, self.var_steady_state, self.var_peak_time,
@@ -451,9 +644,19 @@ class Dashboard:
             return
         if self.connectivity_setting == "Serial":
             if hasattr(self, "mcu") and self.mcu.is_open:
-                self.mcu.write(f"{self.P_gain}:{self.I_gain}:{self.D_gain}:{self.S_point}\n".encode())
+                # BUGFIX: firmware parses this with
+                # sscanf(..., "%f,%f,%f,%f", ...) - comma separated, not
+                # colon separated. The old ":" format never matched, so
+                # gains silently never updated over Serial.
+                self.mcu.write(f"{self.P_gain},{self.I_gain},{self.D_gain},{self.S_point}\n".encode())
             else:
                 messagebox.showerror("config", "no mcu available")
+        if self.connectivity_setting == "UDP":
+            if self.udp_is_connected():
+                msg = f"{self.P_gain},{self.I_gain},{self.D_gain},{self.S_point}\n"
+                self.udp_sock.sendto(msg.encode(), self.udp_remote)
+            else:
+                messagebox.showerror("config", "not connected to ESP32")
         if self.connectivity_setting == "WLAN" and self.ws_is_connected():
             PID = {"P": str(self.P_gain),
                    "I": str(self.I_gain),
@@ -473,6 +676,11 @@ class Dashboard:
         if hasattr(self, "ws") and self.ws and self.ws.sock:
             try:
                 self.ws.close()
+            except:
+                pass
+        if self.udp_sock:
+            try:
+                self.udp_sock.close()
             except:
                 pass
         self.dashboard.destroy()
