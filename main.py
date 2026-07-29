@@ -30,6 +30,13 @@ class Dashboard:
         self.max_points = 500
         self.yarr = []
         self.tarr = []
+        # NEW: parallel array holding the setpoint value in effect at the
+        # moment each sample arrived, so the graph can draw a live
+        # setpoint/reference trace next to the measured value (this is the
+        # "graph concept" ported over from the UAV terminal script: a
+        # process-value trace plotted together with a dashed setpoint
+        # trace on a dark-themed plot).
+        self.sparr = []
         self.port = None
         self.baudrate = "9600"
         self.connectivity_setting = "Serial"
@@ -165,19 +172,37 @@ class Dashboard:
         self.show_graph(g_frame)
 
     def show_graph(self, frame):
+        # ==========================================================
+        # GRAPH CONCEPT ported from the UAV terminal script:
+        #   - dark figure/axes background instead of matplotlib's
+        #     default white
+        #   - a bright green "process value" trace plus a cyan dashed
+        #     "setpoint" trace drawn on the same axes for a clear
+        #     step-response comparison
+        #   - white tick labels / grid tuned for the dark background
+        #   - Line2D objects created once and mutated via set_data()
+        #     each tick rather than clearing and re-plotting the axes
+        # ==========================================================
         self.fig = Figure(figsize=(5, 4), dpi=100)
-        self.ax = self.fig.add_subplot(111)
-        self.ax.set_title("STEP RESPONSE")
-        self.ax.set_ylabel("amplitude")
-        self.ax.set_xlabel("time")
-        # self.ax.yaxis.set_major_locator(MultipleLocator(0.1))
-        # self.ax.xaxis.set_major_locator(MultipleLocator(0.1))
-        self.ax.grid(True)
+        self.fig.patch.set_facecolor("#0d0d0d")
 
-        # PERF: create the Line2D object once and just mutate its data on every
-        # update instead of clearing + re-plotting the whole axes each tick.
-        # This is the single biggest win for smoothness at high sample rates.
-        (self.line,) = self.ax.plot([], [], color="blue", marker=".")
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_facecolor("#111111")
+        self.ax.set_title("STEP RESPONSE", color="white")
+        self.ax.set_ylabel("amplitude", color="white")
+        self.ax.set_xlabel("time", color="white")
+        self.ax.tick_params(colors="white")
+        for spine in self.ax.spines.values():
+            spine.set_color("#444")
+        self.ax.grid(True, color="#222")
+
+        # Process value trace (measured angle / amplitude)
+        (self.line,) = self.ax.plot([], [], color="#00ff41", marker=".", linewidth=2, label="Process Value")
+        # Setpoint / reference trace
+        (self.setpoint_line,) = self.ax.plot([], [], color="#00d4ff", linestyle="--", linewidth=1.5,
+                                              label="Setpoint")
+        legend = self.ax.legend(loc="upper right", facecolor="#111111", edgecolor="#444", labelcolor="white",
+                                 fontsize=8)
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=frame)
         self.canvas.draw()
@@ -289,6 +314,7 @@ class Dashboard:
             self.stop()
             self.yarr.clear()
             self.tarr.clear()
+            self.sparr.clear()
             self.running = True
             self.active_connection = "Serial"
             self.update_graph()
@@ -300,6 +326,7 @@ class Dashboard:
             self.clear()
             self.yarr.clear()
             self.tarr.clear()
+            self.sparr.clear()
             self.running = True
             self.active_connection = "UDP"
             self.update_graph()
@@ -308,6 +335,7 @@ class Dashboard:
             self.clear()
             self.yarr.clear()
             self.tarr.clear()
+            self.sparr.clear()
             self.running = True
             self.active_connection = "WLAN"
             self.update_graph()
@@ -329,7 +357,11 @@ class Dashboard:
                             break
                         frame = self._parse_frame(data)
                         if frame is not None:
-                            self.data_queue.put(frame)
+                            t_val, y_val = frame
+                            # Tag each sample with the setpoint that was in
+                            # effect when it arrived so the graph can draw
+                            # the live setpoint trace alongside it.
+                            self.data_queue.put((t_val, y_val, self.S_point))
             else:
                 self.mcu.close()
                 messagebox.showinfo("port", "no mcu")
@@ -350,7 +382,7 @@ class Dashboard:
                     print(data)
                     parts = data.split(",")
                     if len(parts) == 2:
-                        self.data_queue.put_nowait((float(parts[0]), float(parts[1])))
+                        self.data_queue.put_nowait((float(parts[0]), float(parts[1]), self.S_point))
         except Exception as e:
             messagebox.showerror("websocket error", str(e))
 
@@ -368,8 +400,9 @@ class Dashboard:
                     text = data.decode("utf-8", errors="ignore").strip()
                     frame = self._parse_frame(text)
                     if frame is not None:
+                        t_val, y_val = frame
                         try:
-                            self.data_queue.put_nowait(frame)
+                            self.data_queue.put_nowait((t_val, y_val, self.S_point))
                         except queue.Full:
                             pass
         except Exception as e:
@@ -484,11 +517,12 @@ class Dashboard:
         got_new_data = self.process_queue()
 
         if got_new_data:
-            # PERF: mutate the existing line's data instead of ax.cla() +
+            # PERF: mutate the existing lines' data instead of ax.cla() +
             # re-plot + re-set title/labels/grid every tick. cla() throws
             # away all the axes styling and forces a full re-render; set_data
-            # just updates the line's vertices.
+            # just updates each line's vertices.
             self.line.set_data(self.tarr, self.yarr)
+            self.setpoint_line.set_data(self.tarr, self.sparr)
 
             # Rescale the view to fit the new data, then redraw only what's
             # needed. relim()/autoscale_view() are cheap compared to a full
@@ -540,26 +574,30 @@ class Dashboard:
         got_new_data = False
         while True:
             try:
-                t_val, y_val = self.data_queue.get_nowait()
+                t_val, y_val, sp_val = self.data_queue.get_nowait()
             except queue.Empty:
                 break
             self.yarr.append(y_val)
             self.tarr.append(t_val)
+            self.sparr.append(sp_val)
             got_new_data = True
         if len(self.tarr) > self.max_points:
             overflow = len(self.tarr) - self.max_points
             del self.tarr[:overflow]
             del self.yarr[:overflow]
+            del self.sparr[:overflow]
         return got_new_data
 
     def clear(self):
         self.tarr.clear()
         self.yarr.clear()
+        self.sparr.clear()
         if hasattr(self, "mcu") and self.mcu and self.mcu.is_open:
             self.mcu.reset_input_buffer()
         # PERF: no need to cla()/re-set title/labels/grid, just clear the
-        # line's data and redraw.
+        # lines' data and redraw.
         self.line.set_data([], [])
+        self.setpoint_line.set_data([], [])
         self.canvas.draw_idle()
         print(self.yarr)
 
@@ -635,10 +673,10 @@ class Dashboard:
 
     def config(self, kp, ki, kd, sp):
         try:
-            self.P_gain = int(kp)
-            self.I_gain = int(ki)
-            self.D_gain = int(kd)
-            self.S_point = int(sp)
+            self.P_gain = float(kp)
+            self.I_gain = float(ki)
+            self.D_gain = float(kd)
+            self.S_point = float(sp)
         except:
             messagebox.showerror("PID", "enter numbers only!")
             return
